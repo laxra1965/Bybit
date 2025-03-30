@@ -1,77 +1,134 @@
-from kivy.app import App
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.textinput import TextInput
-from kivy.uix.button import Button
-import requests
+import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
+import time
 
-class CryptoScanner(BoxLayout):
-    def __init__(self, **kwargs):
-        super().__init__(orientation='vertical', **kwargs)
-        
-        self.capital_input = TextInput(hint_text="Enter Trading Capital ($)", multiline=False)
-        self.add_widget(self.capital_input)
-        
-        self.scan_button = Button(text="Scan Patterns")
-        self.scan_button.bind(on_press=self.scan_patterns)
-        self.add_widget(self.scan_button)
-        
-        self.result_label = Label(text="Results will appear here")
-        self.add_widget(self.result_label)
+# Function to get Bybit crypto pairs
+def get_bybit_pairs():
+    url = "https://api.bybit.com/v5/market/instruments-info?category=spot"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            st.error(f"API Error: {response.status_code}")
+            return []
+        try:
+            data = response.json()
+            if "result" in data and "list" in data["result"]:
+                return [s["symbol"] for s in data["result"]["list"]]
+            else:
+                st.error("Unexpected API response format.")
+                return []
+        except requests.exceptions.JSONDecodeError:
+            st.error("Failed to parse JSON response from Bybit API.")
+            st.text(response.text)  # Show raw response for debugging
+            return []
+    except requests.exceptions.RequestException as e:
+        st.error(f"Request failed: {e}")
+        return []
+
+# Function to detect reversal and continuation patterns, including flags
+def detect_pattern(df):
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
     
-    def fetch_data(self, symbol, interval):
+    pattern = "No Clear Pattern"
+    tp1, tp2, tp3, sl = None, None, None, None
+    
+    # Reversal patterns
+    if close.iloc[-1] > close.iloc[-2] and close.iloc[-2] < close.iloc[-3]:
+        pattern = "Bullish Reversal"
+        tp1, tp2, tp3 = close.iloc[-1] * 1.02, close.iloc[-1] * 1.04, close.iloc[-1] * 1.06
+        sl = close.iloc[-1] * 0.98
+    elif close.iloc[-1] < close.iloc[-2] and close.iloc[-2] > close.iloc[-3]:
+        pattern = "Bearish Reversal"
+        tp1, tp2, tp3 = close.iloc[-1] * 0.98, close.iloc[-1] * 0.96, close.iloc[-1] * 0.94
+        sl = close.iloc[-1] * 1.02
+    
+    # Continuation patterns
+    elif high.max() == high.iloc[-1] and low.min() == low.iloc[0]:
+        pattern = "Triangle Pattern"
+    elif close.iloc[-1] > np.mean(close[-5:]):
+        pattern = "Continuation Uptrend"
+    elif close.iloc[-1] < np.mean(close[-5:]):
+        pattern = "Continuation Downtrend"
+    
+    # Flag patterns (checking for sharp move followed by consolidation)
+    elif (close.iloc[-1] > close.iloc[-5] * 1.02) and (np.std(close[-5:]) < np.std(close[-10:-5])):
+        pattern = "Bullish Flag"
+        tp1, tp2, tp3 = close.iloc[-1] * 1.02, close.iloc[-1] * 1.04, close.iloc[-1] * 1.06
+        sl = close.iloc[-1] * 0.98
+    elif (close.iloc[-1] < close.iloc[-5] * 0.98) and (np.std(close[-5:]) < np.std(close[-10:-5])):
+        pattern = "Bearish Flag"
+        tp1, tp2, tp3 = close.iloc[-1] * 0.98, close.iloc[-1] * 0.96, close.iloc[-1] * 0.94
+        sl = close.iloc[-1] * 1.02
+    
+    return pattern, df.iloc[-1]["timestamp"], tp1, tp2, tp3, sl
+
+# Function to fetch and analyze market data
+def scan_patterns(symbol, interval):
+    try:
         url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={interval}"
         response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        return None
-    
-    def detect_pattern(self, df):
-        close = df["close"].astype(float)
-        pattern = "No Clear Pattern"
-        tp1, tp2, tp3, sl = None, None, None, None
-        
-        if close.iloc[-1] > close.iloc[-2]:
-            pattern = "Bullish Reversal"
-            tp1, tp2, tp3 = close.iloc[-1] * 1.02, close.iloc[-1] * 1.04, close.iloc[-1] * 1.06
-            sl = close.iloc[-1] * 0.98
-        elif close.iloc[-1] < close.iloc[-2]:
-            pattern = "Bearish Reversal"
-            tp1, tp2, tp3 = close.iloc[-1] * 0.98, close.iloc[-1] * 0.96, close.iloc[-1] * 0.94
-            sl = close.iloc[-1] * 1.02
-        
-        return pattern, tp1, tp2, tp3, sl
-    
-    def calculate_trade(self, capital, entry, tp1, tp2, tp3, sl):
-        leverage = round(1000 / entry, 1)
-        profit_tp1 = (tp1 - entry) * leverage
-        profit_tp2 = (tp2 - entry) * leverage
-        profit_tp3 = (tp3 - entry) * leverage
-        loss = (entry - sl) * leverage
-        return leverage, profit_tp1, profit_tp2, profit_tp3, loss
-    
-    def scan_patterns(self, instance):
-        capital = float(self.capital_input.text) if self.capital_input.text else 100
-        symbol = "BTCUSDT"
-        interval = "15"
-        data = self.fetch_data(symbol, interval)
-        
-        if data and "result" in data and "list" in data["result"]:
-            columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
-            df = pd.DataFrame(data["result"]["list"], columns=columns)
-            pattern, tp1, tp2, tp3, sl = self.detect_pattern(df)
-            leverage, profit_tp1, profit_tp2, profit_tp3, loss = self.calculate_trade(capital, df.iloc[-1]["close"], tp1, tp2, tp3, sl)
-            
-            result_text = f"Pattern: {pattern}\nTP1: {tp1}\nTP2: {tp2}\nTP3: {tp3}\nSL: {sl}\nLeverage: {leverage}\nProfit TP1: {profit_tp1}\nProfit TP2: {profit_tp2}\nProfit TP3: {profit_tp3}\nLoss: {loss}"
-            self.result_label.text = result_text
-        else:
-            self.result_label.text = "Error fetching data"
+        if response.status_code != 200:
+            return f"API Error: {response.status_code}"
+        try:
+            data = response.json()
+            if "result" in data and "list" in data["result"]:
+                columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
+                raw_data = data["result"]["list"]
+                filtered_data = [row[:len(columns)] for row in raw_data]  # Ensure correct column count
+                df = pd.DataFrame(filtered_data, columns=columns)
+                return detect_pattern(df)
+            return "No Data"
+        except requests.exceptions.JSONDecodeError:
+            return "JSON Parse Error"
+    except requests.exceptions.RequestException as e:
+        return f"Request failed: {e}"
 
-class CryptoScannerApp(App):
-    def build(self):
-        return CryptoScanner()
+# Streamlit UI
+st.title("Crypto Pattern Scanner (Bybit v5)")
+st.write("Scanning Bybit crypto pairs for emerging patterns...")
 
-if __name__ == "__main__":
-    CryptoScannerApp().run()
+# Select timeframe
+timeframes = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "4h": "240",
+    "1d": "1440",
+}
+selected_timeframe = st.selectbox("Select Timeframe", list(timeframes.keys()))
+
+# Get Bybit pairs
+pairs = get_bybit_pairs()
+if not pairs:
+    st.stop()  # Stop execution if no pairs are available
+
+selected_pairs = st.multiselect("Select Crypto Pairs", pairs, default=pairs[:5])
+
+if st.button("Scan Patterns"):
+    if not selected_pairs:
+        st.warning("Please select at least one trading pair.")
+    else:
+        results = []
+        with st.spinner("Scanning..."):
+            for pair in selected_pairs:
+                pattern, timestamp, tp1, tp2, tp3, sl = scan_patterns(pair, timeframes[selected_timeframe])
+                results.append({
+                    "Pair": pair,
+                    "Pattern": pattern,
+                    "Timestamp": timestamp,
+                    "TP1": tp1,
+                    "TP2": tp2,
+                    "TP3": tp3,
+                    "Stop Loss": sl
+                })
+                time.sleep(1)  # Avoid API rate limits
+
+        df = pd.DataFrame(results)
+        st.dataframe(df)
